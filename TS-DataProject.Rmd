@@ -1,0 +1,199 @@
+---
+title: "TSDataProject"
+output: html_document
+author: "Jacob Croskey"
+date: "2024-05-06"
+---
+
+```{r setup, include=FALSE}
+setwd("~//Desktop/Time Series")
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library("readxl")
+library("tseries")
+library("astsa")
+library(forecast)
+library(vars)
+library(urca)
+library(dynamac)
+library(TSstudio)
+library(stargazer)
+library(ARDL)
+library(pbapply)
+library(AICcmodavg)
+library(ggplot2)
+library(MASS)
+```
+
+## Reading in Data
+### I cleaned some of the data in this chunk as well to prepare them to be transformed into Time Series.
+```{r}
+#Average Temp Data and Transformation
+avgtemp <- read.csv("tempdata.csv")
+avgtemp$Date <- as.Date(paste0(avgtemp$Date, "-01"))
+avgtemp <- avgtemp %>% 
+  rename(temp = Value)
+
+#Average Ozone Data and Transformation
+airqual <- read.csv("pollution_2000_2023.csv")
+ozone <- airqual[c("State", "Date", "O3.Mean")]
+ozone$Date <- as.Date(ozone$Date)
+monthlyozone <- ozone %>%
+  filter(day(Date) == 1)
+amo <- monthlyozone %>%
+  group_by(Date) %>%
+  summarise(avgO3 = mean(O3.Mean, na.rm = TRUE), .groups = 'drop')
+```
+
+## Plots of Temperatures and Ozone Levels
+```{r}
+plot(amo)
+plot(avgtemp)
+```
+
+## Transforming Data Into Time Series And Checking for Stationarity
+```{r}
+tempf = ts(data = avgtemp$temp, frequency = 12, start = c(2000,1), end = c(2023, 1))
+plot(tempf)
+lines(lowess(tempf), col = "red")
+
+ozonelevel = ts(data = amo$avgO3, frequency = 12, start = c(2000,1), end = c(2023, 1))
+plot(ozonelevel)
+lines(lowess(ozonelevel), col = "blue")
+
+pp.test(tempf)
+pp.test(ozonelevel)
+```
+
+## Transformation and Combination of Data into a Time Series for Analyzation
+```{r}
+variables <- ts.union(tempf, ozonelevel)
+plot(variables)
+start1 = start = c(2000,1); end1 = end = c(2023,1)
+
+variables_df <- data.frame(date = time(variables),
+                           Temp = as.numeric(variables[, "tempf"]),
+                           Ozone = as.numeric(variables[, "ozonelevel"]))
+
+# Convert 'date' from fractional years to actual dates (assuming monthly data starting January 2000)
+variables_df$date <- as.Date(ISOdate(2000, 1, 1) + (variables_df$date - 2000) * 365.25)
+variables_df$month <- format(variables_df$date, "%m")
+
+# Create dummy variables for months
+month_dummies <- model.matrix(~ factor(month) - 1, data = variables_df)
+variables_df <- cbind(variables_df, month_dummies)
+```
+
+## Creating Lagged Variables and Releveling NA Values Introduced by Lagging
+```{r}
+variables_df$lag_Ozone = lag(variables_df$Ozone, 1)
+variables_df$lag_Temp = lag(variables_df$Temp, 1)
+variables_df <- na.omit(variables_df)
+
+#Setting Month as Factor and Setting January for Reference Month to eliminate Perfect Colinearity
+variables_df$month <- as.factor(variables_df$month)
+variables_df$month <- relevel(variables_df$month, ref = "01")
+```
+
+
+```{r eval=FALSE, include=FALSE}
+## Checking Optimal Number of Lags using BIC/AIC Criterion
+#Checking Optimal Number of Lags with BIC
+models <- list()
+bic_values <- numeric()
+
+for (i in 1:6) {  # testing up to 6 lags
+  formula <- as.formula(
+    paste("Ozone ~ lag(Ozone, 1:", i, ") + Temp + lag(Temp, 1:", i, ") + factor(month)", collapse = "+")
+  )
+  models[[i]] <- lm(formula, data = variables_df)
+  bic_values[i] <- BIC(models[[i]])
+}
+# Which model has the lowest BIC?
+best_lag <- which.min(bic_values)
+best_lag 
+
+#Checking Optimal Number of Lags with AIC
+#install.packages("pbapply")
+library(pbapply)
+#install.packages("AICcmodavg")
+library(AICcmodavg)
+models <- list()
+aic_values <- numeric()
+
+for (i in 1:6) {  # testing up to 6 lags
+  formula <- as.formula(
+    paste("Ozone ~ lag(Ozone, 1:", i, ") + lag(Temp, 1:", i, ") + factor(month) - 1", collapse = "+")
+  )
+  models[[i]] <- lm(formula, data = variables_df)
+  aic_values[i] <- AICc(models[[i]])
+}
+# Which model has the lowest AIC?
+which.min(aic_values)
+```
+
+## Specifying ARDL Model with Lags and Dummies 
+```{r}
+ardl_model <- lm(Ozone ~ lag_Ozone + Temp + lag_Temp + factor(month), data = variables_df)
+
+summary(ardl_model)
+plot(ardl_model)
+```
+
+## AR Forecast of Temperature for 12 Months Out
+```{r}
+# Fit AR model automatically selecting optimal lags
+ar_model_xt <- auto.arima(variables_df$Temp, seasonal = TRUE)
+
+summary(ar_model_xt)
+
+forecast_xt <- forecast(ar_model_xt, h = 12, level = 95)
+
+# Plot the forecasts including 95% prediction intervals
+plot(forecast_xt, main = "Temperature Forecast with 95% Prediction Interval", xlab = "Time (Months)", ylab = "Temperature (°F)")
+print(forecast_xt)
+```
+
+## AR Forecast of Ozone Levels
+```{r}
+# Build the linear model using Ozone as dependent variable and Temperature, lagged Ozone, and month dummies as predictors
+linear_model_yt <- lm(Ozone ~ Temp + lag_Ozone + factor(month) - 1, data = variables_df)
+
+# View the summary of the model to check for significance and fit
+summary(linear_model_yt)
+
+# Assuming forecast_xt contains forecasted temperatures and forecast_dates are the corresponding future dates
+forecast_data <- data.frame(
+  Temp = forecast_xt$mean,  # Forecasted temperatures from AR model
+  lag_Ozone = rep(tail(variables_df$Ozone, 1), 12),  # Repeat last known ozone value
+  date = seq.Date(from = tail(variables_df$date, 1) + 1, by = "month", length.out = 12)
+)
+
+# Convert dates to month factors if your model includes monthly effects
+forecast_data$month <- factor(format(forecast_data$date, "%m"), levels = levels(variables_df$month))
+
+# Recreate the dummy variables for the months (if your model includes this)
+month_dummies <- model.matrix(~ month - 1, data = forecast_data)
+forecast_data <- cbind(forecast_data, month_dummies[, -1])  # Exclude intercept column
+
+yt_forecasts <- predict(linear_model_yt, newdata = forecast_data, interval = "prediction")
+
+# Create a data frame to store the results for better visualization
+results_df <- data.frame(
+  Date = forecast_data$date,
+  Ozone_Forecast = yt_forecasts[, "fit"],
+  Lower_95_CI = yt_forecasts[, "lwr"],
+  Upper_95_CI = yt_forecasts[, "upr"]
+)
+
+# Print the forecast results
+print(results_df)
+
+#Plotting Forecast
+ggplot(results_df, aes(x = Date+30)) +
+  geom_line(aes(y = Ozone_Forecast), color = "blue") +
+  geom_ribbon(aes(ymin = Lower_95_CI, ymax = Upper_95_CI), fill = "blue", alpha = 0.3) +
+  labs(title = "Forecasted Ozone Levels", x = "Date", y = "Ozone Level")
+```
+
